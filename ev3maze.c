@@ -1,119 +1,76 @@
 #include <stdio.h>
-#include <stdlib.h>
-#include "SDL.h"
-#include "SDL_net.h"
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/videodev2.h>
+#include <fcntl.h>
+#include <errno.h>
 #include "ev3.h"
 #include "ev3_tacho.h"
+#include "SDL.h"
+#include "SDL_net.h"
 
-#define PI 3.14
+uint8_t sn1, sn2;
+int max_speed;
 
-int main(int arvc, char* argv[]) {
-	SDL_Init(SDL_INIT_VIDEO);
-	SDLNet_Init();
+int main() {
+	int fd;
+	struct v4l2_capability cap;
+	struct v4l2_requestbuffers reqbuf;
+	struct v4l2_buffer buffer;
+	reqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	reqbuf.memory = V4L2_MEMORY_MMAP;
+	reqbuf.count = 4;
+	void* bufmem[4];
 	
-	const float baseDiameter = 11; // cm
-	const float wheelDiameter = 5; // cm
-	float wheelCircumference = wheelDiameter * PI;
-	float baseCircumference = baseDiameter * PI;
-	float travelDistance;
-	float mazeLenght = 0;
-	int mazeWidth = 0;
-	FLAGS_T state;
+	buffer.type = reqbuf.type;
+	buffer.memory = reqbuf.memory;
+	buffer.index = 0;
+	fd = open("/dev/video0", O_RDWR);
+	if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == -1) {
+		printf("error opening video capture, couldnt find device \n");
+		return -1;
+	}
+	printf("device name %s\n", cap.card);
 	
-	int recv_data;
+	ioctl(fd, VIDIOC_REQBUFS, &reqbuf); // request buffers
+	for (int i = 0; i < 4; i++) {
+		buffer.index = i;
+		buffer.type = reqbuf.type;
+		ioctl(fd, VIDIOC_QUERYBUF, &buffer);
+		printf("buffer %d offset = %d, lenght = %d, bytes used %d\n", i, buffer.m.offset, buffer.length, buffer.bytesused);
+		bufmem[i] = mmap(NULL /* start anywhere */ ,
+		   buffer.length, PROT_READ, MAP_SHARED, fd,
+		   buffer.m.offset);
+		ioctl(fd, VIDIOC_QBUF, &buffer); // queue reqested buffer
+		if (ioctl(fd, VIDIOC_STREAMON, &reqbuf.type) == -1) {
+			printf("error starting stream\n");
+			return -1;
+		}
+		// after this, can take out buffers
+	}
+	
+	// send image data
+	
+	SDLNet_init();
+	IPaddress serverIP;
 	TCPsocket server, client;
-	IPaddress serverIp;
 	
-	// initialize 
-	mazeWidth = atoi(argv[1]);
-	mazeLenght = atoi(argv[2]);
-	
-	if (ev3_init() == -1) return -1;
-	if (ev3_tacho_init() == -1) return -1;
-	uint8_t sn1, sn2, sn_port; 
-	int max_speed, tacho_counts;
-	ev3_search_tacho(LEGO_EV3_L_MOTOR, &sn1, 0);
-	ev3_search_tacho(LEGO_EV3_L_MOTOR, &sn2, sn1+1);
-	get_tacho_max_speed(sn1, &max_speed);
-	get_tacho_count_per_rot(sn1, &tacho_counts);
-	
-	SDLNet_ResolveHost(&serverIp, NULL, 10504);
-	server = SDLNet_TCP_Open(&serverIp);
-	if (server) { printf("opened server socket \n"); }
-	printf("listening for connections\n");
-	
+	SDLNet_ResolveHost(&serverIP, NULL, 1234);
+	printf("waiting for client\n");
+	server = SDLNet_TCP_Open(&serverIP);
 	while (!client) {
 		client = SDLNet_TCP_Accept(server);
 	}
-	printf("received a connection\n");
-	// 1 - forward
-	// 2 - turn
-	// 3 - end
-	while (1) {
-		SDLNet_TCP_Recv(client, &recv_data, sizeof(int)); // получение через протокол TCP, используется библиотека SDL
-		printf("received code = %d\n", recv_data);
-		switch (recv_data) {
-			case 1: { // отработка комманды типа "ехать вперёд"
-				SDLNet_TCP_Recv(client, &recv_data, sizeof(int));
-				printf("run forward for = %f\n", travelDistance = recv_data * (mazeLenght/128));
-				travelDistance = recv_data * (mazeLenght/128); // 0,1640625
-				
-				set_tacho_stop_action_inx(sn1, TACHO_COAST); // настройка двигателя
-				set_tacho_polarity_inx(sn1, TACHO_NORMAL);
-				set_tacho_speed_sp(sn1, max_speed/8);
-				set_tacho_position_sp(sn1, (tacho_counts / 15.5) * travelDistance);
-				set_tacho_ramp_up_sp(sn1, 200);
-				set_tacho_ramp_down_sp(sn1, 200);
-				set_tacho_command_inx(sn1, TACHO_RUN_TO_REL_POS); // запуск команды
-				
-				set_tacho_polarity_inx(sn2, TACHO_NORMAL); 
-				set_tacho_stop_action_inx(sn2, TACHO_COAST);
-				set_tacho_speed_sp(sn2, max_speed/8);
-				set_tacho_position_sp(sn2, (tacho_counts / 15.5) * travelDistance);
-				set_tacho_ramp_up_sp(sn2, 200);
-				set_tacho_ramp_down_sp(sn2, 200);
-				set_tacho_command_inx(sn2, TACHO_RUN_TO_REL_POS);
-				do {
-					get_tacho_state_flags(sn1, &state);
-				} while(state); // проверка состояния двигателя
-				break;
-			}
-			case 2: {
-				SDLNet_TCP_Recv(client, &recv_data, sizeof(int));
-				printf("turn for = %d degrees\n", recv_data);
-				if (recv_data < 0) {
-					recv_data = recv_data * -1;
-					set_tacho_polarity_inx(sn1, TACHO_INVERSED);
-					set_tacho_polarity_inx(sn2, TACHO_NORMAL);
-				} else {
-					set_tacho_polarity_inx(sn1, TACHO_NORMAL);
-					set_tacho_polarity_inx(sn2, TACHO_INVERSED);
-				}
-				travelDistance = (baseCircumference / 360) * recv_data;
-				
-				set_tacho_stop_action_inx(sn1, TACHO_BRAKE);
-				set_tacho_speed_sp(sn1, max_speed/8);
-				set_tacho_position_sp(sn1, (tacho_counts / wheelCircumference) * travelDistance);
-				set_tacho_ramp_up_sp(sn1, 200);
-				set_tacho_ramp_down_sp(sn1, 200);
-				set_tacho_command_inx(sn1, TACHO_RUN_TO_REL_POS);
-				
-				set_tacho_stop_action_inx(sn2, TACHO_BRAKE);
-				set_tacho_speed_sp(sn2, max_speed/8);
-				set_tacho_position_sp(sn2, (tacho_counts / wheelCircumference) * travelDistance);
-				set_tacho_ramp_up_sp(sn2, 200);
-				set_tacho_ramp_down_sp(sn2, 200);
-				set_tacho_command_inx(sn2, TACHO_RUN_TO_REL_POS);
-				do {
-					get_tacho_state_flags(sn1, &state);
-				} while(state);
-				break;
-			}
-			case 3: {
-				SDLNet_Quit();
-				return 0;
-				break;
-			}
-		}
+	printf("client connected\n");
+	
+	buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	buffer.memory = V4L2_MEMORY_MMAP;
+	ioctl(fd, VIDIOC_DQBUF, &buffer);
+	printf("buffer index = %d bytes used %d\n", buffer.index, buffer.bytesused);
+	printf("offset = %d\n", buffer.m.offset);
+	for (int i = 0; i < 178*128; i++) {
+		SDLNet_TCP_Send(client, (void*)(bufmem[buffer.index] + (sizeof(unsigned char) * i * 2)), sizeof(unsigned char) );
 	}
+	SDLNet_Quit();
+	
 }
